@@ -132,7 +132,8 @@ class ESPandasConnector(ESConnector):
                 "_source": row
             }
 
-            if self._es_major == '7' or self._es_major == '1':
+            if (self._es_major == '7' and self._es_distribution == 'elasticsearch') or\
+               (self._es_major == '1' and self._es_distribution == 'opensearch'):
                 doc.pop('_type')
 
             docs.append(doc)

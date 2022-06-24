@@ -20,11 +20,15 @@
 #     Valerio Cosentino <valcos@bitergia.com>
 #
 import logging
+import json
+import os
 import unittest
 
-from base import TestBaseBackend
-from grimoire_elk.enriched.utils import REPO_LABELS
+from base import TestBaseBackend, data2es
+from grimoire_elk.enriched.utils import anonymize_url, REPO_LABELS
 from grimoire_elk.enriched.confluence import NO_ANCESTOR_TITLE
+from grimoire_elk.raw.confluence import ConfluenceOcean
+from grimoire_elk.utils import get_elastic
 
 
 class TestConfluence(TestBaseBackend):
@@ -118,6 +122,13 @@ class TestConfluence(TestBaseBackend):
             eitem = enrich_backend.get_rich_item(item)
             self.assertIn(REPO_LABELS, eitem)
 
+    def test_perceval_params(self):
+        """Test the extraction of perceval params from an URL"""
+
+        url = "http://example.com --spaces=[TEST, HOME]"
+        expected_params = ["http://example.com", "--spaces", "TEST", "HOME"]
+        self.assertListEqual(ConfluenceOcean.get_perceval_params_from_url(url), expected_params)
+
     def test_raw_to_enrich_sorting_hat(self):
         """Test enrich with SortingHat"""
 
@@ -171,6 +182,66 @@ class TestConfluence(TestBaseBackend):
 
         result = self._test_refresh_project()
         # ... ?
+
+    def test_raw_fix_item(self):
+        """Test fix item to anonymize fields"""
+
+        with open(os.path.join("data", self.connector + "_with_credentials.json")) as f:
+            self.items = json.load(f)
+
+        self.ocean_backend = self.connectors[self.connector][1](None)
+
+        for item in self.items:
+            # Check that the fields are not anonymized.
+            self.assertNotEqual(item['origin'], anonymize_url(item['origin']))
+            self.assertNotEqual(item['tag'], anonymize_url(item['tag']))
+            self.assertNotEqual(item['data']['content_url'], anonymize_url(item['data']['content_url']))
+
+            # Anonymize fields (origin, tag, data.content_url) using '_fix_item' method.
+            self.ocean_backend._fix_item(item)
+
+            # Check that the fields are anonymized.
+            self.assertEqual(item['origin'], anonymize_url(item['origin']))
+            self.assertEqual(item['tag'], anonymize_url(item['tag']))
+            self.assertEqual(item['data']['content_url'], anonymize_url(item['data']['content_url']))
+
+    def test_items_to_raw_anonymized_fields(self):
+        """Test that the documents stored in the raw index the fields are anonymized"""
+
+        with open(os.path.join("data", self.connector + "_with_credentials.json")) as f:
+            self.items = json.load(f)
+
+        self.ocean_backend = self.connectors[self.connector][1](None)
+        elastic_ocean = get_elastic(self.es_con, self.ocean_index, True, self.ocean_backend, self.ocean_aliases)
+        self.ocean_backend.set_elastic(elastic_ocean)
+
+        # Anonymize the fields using 'anonymize_url' method.
+        expected_anonymized_fields = []
+        for item in self.items:
+            new = {
+                'origin': anonymize_url(item['origin']),
+                'tag': anonymize_url(item['tag']),
+                'content_url': anonymize_url(item['data']['content_url'])
+            }
+            expected_anonymized_fields.append(new)
+
+        # Put items into the raw index.
+        expected_items = len(self.items)
+        raw_items = data2es(self.items, self.ocean_backend)
+        self.assertEqual(raw_items, expected_items)
+
+        # Fetch items from the raw index.
+        raw_fields = []
+        for item in self.ocean_backend.fetch():
+            new = {
+                'origin': item['origin'],
+                'tag': item['tag'],
+                'content_url': item['data']['content_url']
+            }
+            raw_fields.append(new)
+
+        # Check that the fields are anonymized.
+        self.assertListEqual(raw_fields, expected_anonymized_fields)
 
 
 if __name__ == "__main__":

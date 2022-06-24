@@ -56,7 +56,7 @@ def get_repository_filter(perceval_backend, perceval_backend_name, term=False):
     field = 'origin'
     value = anonymize_url(perceval_backend.origin)
 
-    if perceval_backend_name in ["meetup", "nntp", "stackexchange", "jira"]:
+    if perceval_backend_name in ["meetup", "nntp", "stackexchange", "jira", "hyperkitty"]:
         # Until tag is supported in all raw and enriched indexes
         # we should use origin. But stackexchange and meetup won't work with origin
         # because the tag must be included in the filter.
@@ -83,6 +83,31 @@ def get_repository_filter(perceval_backend, perceval_backend_name, term=False):
         # In GitHub we receive GITHUB + '/', the site url without org and repo
         # In Meetup we receive https://meetup.com/ as the tag
         filter_ = {}
+
+    return filter_
+
+
+def get_confluence_spaces_filter(repo_spaces, perceval_backend_name):
+    """ Get the spaces needed for get the items in a confluence instance """
+
+    filter_ = {}
+
+    if not repo_spaces or perceval_backend_name != "confluence":
+        return filter_
+
+    field = 'data._expandable.space'
+    value_path = "/rest/api/space/"
+    values = repo_spaces
+
+    filter_ = {
+        "should": []
+    }
+
+    for value in values:
+        new = {
+            "term": {field: value_path + value}
+        }
+        filter_["should"].append(new)
 
     return filter_
 

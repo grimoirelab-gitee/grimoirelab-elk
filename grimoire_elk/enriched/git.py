@@ -38,7 +38,6 @@ from perceval.backends.core.git import (GitCommand,
                                         EmptyRepositoryError,
                                         RepositoryError)
 from .enrich import Enrich, metadata
-from .sortinghat_gelk import SortingHat
 from .study_ceres_aoc import areas_of_code, ESPandasConnector
 from ..elastic_mapping import Mapping as BaseMapping
 from ..elastic_items import HEADER_JSON, MAX_BULK_UPDATE_SIZE
@@ -79,7 +78,7 @@ class GitEnrich(Enrich):
 
     # REGEX to extract authors from a multi author commit: several authors present
     # in the Author field in the commit. Used if self.pair_programming is True
-    AUTHOR_P2P_REGEX = re.compile(r'(?P<first_authors>.* .*) and (?P<last_author>.* .*) (?P<email>.*)')
+    AUTHOR_P2P_REGEX = re.compile(r'(?P<first_authors>.* .*) ([aA][nN][dD]|&|\+) (?P<last_author>.* .*) (?P<email>.*)')
     AUTHOR_P2P_NEW_REGEX = re.compile(r"Co-authored-by:(?P<first_authors>.* .*)<(?P<email>.*)>\n?")
 
     # REGEX to extract authors from the commit
@@ -364,6 +363,7 @@ class GitEnrich(Enrich):
         if 'message' not in commit:
             return
 
+        meta_eitem = {}
         for line in commit['message'].split('\n'):
             m = self.AUTHOR_REGEX.match(line)
             if not m:
@@ -378,18 +378,16 @@ class GitEnrich(Enrich):
 
             if self.sortinghat:
                 # Create SH identity if it does not exist
-                SortingHat.add_identity(self.sh_db, identity, self.get_connector_name())
+                self.add_sh_identity(identity)
                 item_date = str_to_datetime(eitem[self.get_field_date()])
                 sh_fields = self.get_item_sh_fields(identity, item_date, rol=meta_field)
             else:
                 sh_fields = self.get_item_no_sh_fields(identity, rol=meta_field)
 
-            for suffix in self.meta_fields_suffixes:
-                eitem[meta_field + suffix].append(sh_fields[meta_field + suffix[:-1]])
-                # Add non_authored_* if it is not the author of the commit
-                if sh_fields[meta_field + '_uuid'] != eitem['author_uuid']:
-                    eitem[self.meta_non_authored_prefix + meta_field + suffix].append(
-                        sh_fields[meta_field + suffix[:-1]])
+            uuid = sh_fields[meta_field + '_uuid']
+            self.add_meta_fields(eitem, meta_eitem, sh_fields, meta_field, uuid, self.meta_fields_suffixes,
+                                 self.meta_non_authored_prefix)
+        eitem.update(meta_eitem)
 
     def __add_pair_programming_metrics(self, commit, eitem):
 
@@ -490,6 +488,7 @@ class GitEnrich(Enrich):
                                  "per author: {}".format(item['data']['Author']))
                     item['data']['authors'] = self.__get_authors(item['data']['Author'])
                     item['data']['Author'] = item['data']['authors'][0]
+                    item['data']['is_git_commit_multi_author'] = 1
                 m = self.AUTHOR_P2P_REGEX.match(item['data']['Commit'])
                 n = self.AUTHOR_P2P_NEW_REGEX.match(item['data']['Author'])
                 if m or n:
@@ -532,10 +531,9 @@ class GitEnrich(Enrich):
                         item['data']['Author'] = authors[i]
                         item['data']['is_git_commit_multi_author'] = 1
                         rich_item = self.get_rich_item(item)
-                        item['data']['is_git_commit_multi_author'] = 1
-                        data_json = json.dumps(rich_item)
                         commit_id = item["uuid"] + "_" + str(i - 1)
                         rich_item['git_uuid'] = commit_id
+                        data_json = json.dumps(rich_item)
                         bulk_json += '{"index" : {"_id" : "%s" } }\n' % rich_item['git_uuid']
                         bulk_json += data_json + "\n"  # Bulk document
                         current += 1
@@ -605,7 +603,8 @@ class GitEnrich(Enrich):
             logger.info("{} Creating out ES index".format(log_prefix))
             # Initialize out index
 
-            if self.elastic.major == '7':
+            if (self.elastic.major == '7' and self.elastic.distribution == 'elasticsearch') or \
+               (self.elastic.major == '1' and self.elastic.distribution == 'opensearch'):
                 filename = pkg_resources.resource_filename('grimoire_elk', 'enriched/mappings/git_aoc_es7.json')
             else:
                 filename = pkg_resources.resource_filename('grimoire_elk', 'enriched/mappings/git_aoc.json')

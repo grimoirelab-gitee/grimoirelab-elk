@@ -28,8 +28,8 @@ jobs:
     name: Python ${{ matrix.python-version }} for ES ${{ matrix.elasticsearch-version }}
     strategy:
       matrix:
-        python-version: [3.6, 3.7, 3.8]
-        elasticsearch-version: [6.1.0, 7.2.0]
+        python-version: [3.7, 3.8]
+        elasticsearch-version: [6.8.6, 7.2.0]
     
     steps:
     - name: Checkout
@@ -51,6 +51,7 @@ jobs:
         poetry run pip install setuptools==57.5.0
         poetry install -vvv
         poetry add -D coveralls
+        poetry run pip install -r requirements_dev.txt
     - name: Verify Elasticsearch connection
       run: |
         curl -fsSL "http://localhost:9200/_cat/health?h=status"

@@ -21,7 +21,6 @@
 #   Miguel Ángel Fernández <mafesan@bitergia.com>
 #
 
-import copy
 import json
 import functools
 import logging
@@ -119,7 +118,6 @@ class Enrich(ElasticItems):
 
     def __init__(self, db_sortinghat=None, db_projects_map=None, json_projects_map=None,
                  db_user='', db_password='', db_host='', insecure=True):
-
         perceval_backend = None
         super().__init__(perceval_backend, insecure=insecure)
 
@@ -234,7 +232,7 @@ class Enrich(ElasticItems):
                     if ds not in ds_repo_to_prj:
                         ds_repo_to_prj[ds] = {}
                 for repo in json[project][ds]:
-                    repo, _ = self.extract_repo_labels(repo)
+                    repo, _ = self.extract_repo_tags(repo)
                     if repo in ds_repo_to_prj[ds]:
                         if project == ds_repo_to_prj[ds][repo]:
                             logger.debug("Duplicated repo: {} {} {}".format(ds, repo, project))
@@ -449,7 +447,7 @@ class Enrich(ElasticItems):
         domain = None
         try:
             domain = email.split("@")[1]
-        except IndexError:
+        except (IndexError, AttributeError):
             # logger.warning("Bad email format: %s" % (identity['email']))
             pass
         return domain
@@ -705,10 +703,40 @@ class Enrich(ElasticItems):
                     enrolls.append(enrollment.organization.name)
                 elif enrollment.start <= item_date <= enrollment.end:
                     enrolls.append(enrollment.organization.name)
-        else:
+
+        if not enrolls:
             enrolls.append(self.unaffiliated_group)
 
         return enrolls
+
+    @staticmethod
+    def get_main_enrollments(enrollments):
+        """ Get the main enrollment given a list of enrollments.
+        If the enrollment contains :: the main one is the first part.
+
+        For example:
+        - Enrollment: Chaoss::Eng
+        - Main: Chaoss
+
+        If there is more than one, it will return ordered alphabetically.
+        """
+        main_orgs = list(map(lambda x: x.split("::")[0], enrollments))
+        main_orgs = sorted(list(set(main_orgs)))
+
+        return main_orgs
+
+    @staticmethod
+    def remove_prefix_enrollments(enrollments):
+        """ Remove the prefix `::` of the enrollments.
+
+        :param enrollments: list of enrollments
+        :return: list of enrollments without prefix
+        """
+        enrolls = [enroll.split("::")[1] if "::" in enroll else
+                   enroll for enroll in enrollments]
+        enrolls_unique = sorted(list(set(enrolls)))
+
+        return enrolls_unique
 
     def __get_item_sh_fields_empty(self, rol, undefined=False):
         """ Return a SH identity with all fields to empty_field """
@@ -749,7 +777,8 @@ class Enrich(ElasticItems):
             rol + "_gender": self.unknown_gender,
             rol + "_gender_acc": None,
             rol + "_org_name": self.unaffiliated_group,
-            rol + "_bot": False
+            rol + "_bot": False,
+            rol + MULTI_ORG_NAMES: [self.unaffiliated_group]
         }
 
     def get_item_sh_fields(self, identity=None, item_date=None, sh_id=None,
@@ -785,8 +814,7 @@ class Enrich(ElasticItems):
             eitem_sh[rol + "_name"] = profile.get('name', eitem_sh[rol + "_name"])
 
             email = profile.get('email', None)
-            if email:
-                eitem_sh[rol + "_domain"] = self.get_email_domain(email)
+            eitem_sh[rol + "_domain"] = self.get_email_domain(email)
 
             eitem_sh[rol + "_gender"] = profile.get('gender', self.unknown_gender)
             eitem_sh[rol + "_gender_acc"] = profile.get('gender_acc', 0)
@@ -799,10 +827,13 @@ class Enrich(ElasticItems):
             eitem_sh[rol + "_gender"] = self.unknown_gender
             eitem_sh[rol + "_gender_acc"] = 0
 
-        eitem_sh[rol + "_org_name"] = self.get_enrollment(eitem_sh[rol + "_uuid"], item_date)
         eitem_sh[rol + "_bot"] = self.is_bot(eitem_sh[rol + '_uuid'])
 
-        eitem_sh[rol + MULTI_ORG_NAMES] = self.get_multi_enrollment(eitem_sh[rol + "_uuid"], item_date)
+        multi_enrolls = self.get_multi_enrollment(eitem_sh[rol + "_uuid"], item_date)
+        main_enrolls = self.get_main_enrollments(multi_enrolls)
+        all_enrolls = list(set(main_enrolls + multi_enrolls))
+        eitem_sh[rol + MULTI_ORG_NAMES] = self.remove_prefix_enrollments(all_enrolls)
+        eitem_sh[rol + "_org_name"] = main_enrolls[0]
 
         return eitem_sh
 
@@ -857,28 +888,7 @@ class Enrich(ElasticItems):
     def get_item_sh_meta_fields(self, eitem, roles=None, suffixes=None, non_authored_prefix=None):
         """Get the SH meta fields from the data in the enriched item."""
 
-        def add_non_authored_fields(eitem_sh, rol, non_authored_prefix, author_uuid):
-            new_eitem_sh = {}
-            # Add the non_authored_* field
-            for item in eitem_sh:
-                if rol in item and non_authored_prefix not in item:
-                    new_eitem_sh[non_authored_prefix + item] = copy.deepcopy(eitem_sh[item])
-
-            uuids_field = non_authored_prefix + rol + '_uuids'
-            # Check if author_uuid is in uuids_field
-            if author_uuid not in new_eitem_sh[uuids_field]:
-                new_eitem_sh.update(eitem_sh)
-                return new_eitem_sh
-
-            # Remove the author in non_authored
-            remove_indices = [i for i, uuid in enumerate(new_eitem_sh[uuids_field]) if uuid == author_uuid]
-            for item in new_eitem_sh:
-                new_eitem_sh[item] = [i for index, i in enumerate(new_eitem_sh[item]) if index not in remove_indices]
-            new_eitem_sh.update(eitem_sh)
-
-            return new_eitem_sh
-
-        eitem_sh = {}  # Item enriched
+        eitem_meta_sh = {}  # Item enriched
 
         date = str_to_datetime(eitem[self.get_field_date()])
 
@@ -891,16 +901,39 @@ class Enrich(ElasticItems):
                 continue
 
             for sh_uuid in sh_uuids:
-                position = sh_uuids.index(sh_uuid)
-                new_eitem = self.get_item_sh_fields(sh_id=sh_uuid, item_date=date, rol=rol)
+                sh_fields = self.get_item_sh_fields(sh_id=sh_uuid, item_date=date, rol=rol)
 
-                for suffix in suffixes:
-                    eitem_sh[rol + suffix] = eitem[rol + suffix]
-                    eitem_sh[rol + suffix][position] = new_eitem[rol + suffix[:-1]]
+                self.add_meta_fields(eitem, eitem_meta_sh, sh_fields, rol, sh_uuid, suffixes, non_authored_prefix)
+
+        return eitem_meta_sh
+
+    def add_meta_fields(self, eitem, meta_eitem, sh_fields, rol, uuid, suffixes, non_authored_prefix):
+        def add_non_authored_fields(author_uuid, uuid, new_eitem, new_list, non_authored_field):
+            if author_uuid == uuid:
+                non_authored = []
+            else:
+                non_authored = new_list
+            new_eitem[non_authored_field] = non_authored
+
+        for suffix in suffixes:
+            field = rol + suffix[:-1]
+            if suffix == "_org_names":
+                field = rol + "_multi" + suffix
+
+            new_list = sh_fields[field]
+            if type(new_list) != list:
+                new_list = [new_list]
+
+            try:
+                meta_eitem[rol + suffix] += new_list
+            except KeyError:
+                meta_eitem[rol + suffix] = new_list
+
             if non_authored_prefix:
-                eitem_sh = add_non_authored_fields(eitem_sh, rol, non_authored_prefix, eitem['author_uuid'])
-
-        return eitem_sh
+                non_authored_field = non_authored_prefix + rol + suffix
+                add_non_authored_fields(eitem['author_uuid'], uuid, meta_eitem, new_list,
+                                        non_authored_field)
+        return meta_eitem
 
     def get_users_data(self, item):
         """ If user fields are inside the global item dict """
@@ -985,6 +1018,14 @@ class Enrich(ElasticItems):
     def get_uuid_from_id(self, sh_id):
         """ Get the SH identity uuid from the id """
         return SortingHat.get_uuid_from_id(self.sh_db, sh_id)
+
+    def add_sh_identities(self, identities):
+        SortingHat.add_identities(self.sh_db, identities,
+                                  self.get_connector_name())
+
+    def add_sh_identity(self, identity):
+        SortingHat.add_identity(self.sh_db, identity,
+                                self.get_connector_name())
 
     def get_sh_ids(self, identity, backend_name):
         """ Return the Sorting Hat id and uuid for an identity """
@@ -1099,7 +1140,8 @@ class Enrich(ElasticItems):
         # Onion currently does not support incremental option
         logger.info("{} Creating out ES index".format(log_prefix))
         # Initialize out index
-        if self.elastic.major == '7' or self.elastic.major == '1':
+        if (self.elastic.major == '7' and self.elastic.distribution == 'elasticsearch') or \
+           (self.elastic.major == '1' and self.elastic.distribution == 'opensearch'):
             filename = pkg_resources.resource_filename('grimoire_elk', 'enriched/mappings/onion_es7.json')
         else:
             filename = pkg_resources.resource_filename('grimoire_elk', 'enriched/mappings/onion.json')
@@ -1837,29 +1879,13 @@ class Enrich(ElasticItems):
             In case there is no specific contribution type, by default all contributions will be considered.
         """
         # The first step is to find the current min and max date for all the authors
-        authors_min_max_data = {}
-
-        es_query = Enrich.authors_min_max_dates(date_field,
-                                                author_field=author_field,
-                                                contribution_type=contribution_type)
-        r = self.requests.post(self.elastic.index_url + "/_search",
-                               data=es_query, headers=HEADER_JSON,
-                               verify=False)
-        try:
-            r.raise_for_status()
-        except requests.exceptions.HTTPError as ex:
-            logger.error("{} error getting authors mix and max date. Aborted.".format(log_prefix))
-            logger.error(ex)
-            return
-
-        for author in r.json()['aggregations']['author']['buckets']:
-            authors_min_max_data[author['key']] = author
+        authors_min_max_data = self.fetch_authors_min_max_dates(log_prefix, author_field, contribution_type, date_field)
 
         # Then we update the min max dates of all authors
-        for author_key in authors_min_max_data:
-            author_min_date = authors_min_max_data[author_key]['min']['value_as_string']
-            author_max_date = authors_min_max_data[author_key]['max']['value_as_string']
-
+        for author in authors_min_max_data:
+            author_min_date = author['min']['value_as_string']
+            author_max_date = author['max']['value_as_string']
+            author_key = author['key']['author_uuid']
             field_name = contribution_type if contribution_type else 'demography'
             es_update = Enrich.update_author_min_max_date(author_min_date, author_max_date,
                                                           author_key, field_name, author_field=author_field)
@@ -1884,6 +1910,45 @@ class Enrich(ElasticItems):
                              log_prefix, author_key))
                 logger.error(ex)
                 return
+
+    def fetch_authors_min_max_dates(self, log_prefix, author_field, contribution_type, date_field):
+        """ Fetch all authors with their first and last date of activity.
+
+        :param log_prefix: log prefix used on logger.
+        :param author_field: field of the author.
+        :param contribution_type: name of the contribution type (if any) which the dates are computed for.
+            In case there is no specific contribution type, by default all contributions will be considered.
+        :param date_field: field used to find the mix and max dates for the author's activity.
+
+        :return: dictionary of authors with min and max dates.
+        """
+        after = None
+
+        while True:
+            es_query = Enrich.authors_min_max_dates(date_field,
+                                                    author_field=author_field,
+                                                    contribution_type=contribution_type,
+                                                    after=after)
+            r = self.requests.post(self.elastic.index_url + "/_search",
+                                   data=es_query, headers=HEADER_JSON,
+                                   verify=False)
+            try:
+                r.raise_for_status()
+            except requests.exceptions.HTTPError as ex:
+                logger.error("{} error getting authors mix and max date. Aborted.".format(log_prefix))
+                logger.error(ex)
+                return
+
+            aggregations_author = r.json()['aggregations']['author']
+
+            # When there are no more elements, it will return an empty list of buckets
+            if not aggregations_author['buckets']:
+                return
+
+            after = aggregations_author['after_key'][author_field]
+
+            for author in aggregations_author['buckets']:
+                yield author
 
     def check_version_conflicts(self, es_update, version_conflicts, log_prefix, max_retries=5):
         """
@@ -1914,7 +1979,7 @@ class Enrich(ElasticItems):
         self.check_version_conflicts(es_update, r.json()['version_conflicts'], log_prefix, max_retries=retries)
 
     @staticmethod
-    def authors_min_max_dates(date_field, author_field="author_uuid", contribution_type=None):
+    def authors_min_max_dates(date_field, author_field="author_uuid", contribution_type=None, after=None):
         """
         Get the aggregation of author with their min and max activity dates
 
@@ -1922,12 +1987,24 @@ class Enrich(ElasticItems):
         :param author_field: field of the author
         :param contribution_type: name of the contribution type (if any) which the dates are computed for.
             In case there is no specific contribution type, by default all contributions will be considered.
+        :param after: value used for pagination
 
         :return: the query to be executed to get the authors min and max aggregation data
         """
 
-        # Limit aggregations: https://github.com/elastic/elasticsearch/issues/18838
-        # 30000 seems to be a sensible number of the number of people in git
+        # Limit aggregations:
+        # - OpenSearch: 10000
+        #   - https://opensearch.org/docs/latest/opensearch/bucket-agg/
+        # - ElasticSearch: 10000
+        #   - https://discuss.elastic.co/t/increasing-max-buckets-for-specific-visualizations/187390/4
+        #   - When you try to fetch more than 10000 it will return this error message:
+        #     {
+        #       "type": "too_many_buckets_exception",
+        #       "reason": "Trying to create too many buckets. Must be less than or equal to: [10000] but was [20000].
+        #                 This limit can be set by changing the [search.max_buckets] cluster level setting.",
+        #       "max_buckets": 10000
+        #     }
+
         query_type = ""
         if contribution_type:
             query_type = """"query": {
@@ -1939,15 +2016,31 @@ class Enrich(ElasticItems):
               }
             }
           },""" % contribution_type
+
+        query_after = ""
+        if after:
+            query_after = """"after": {
+                  "%s": "%s"
+                },""" % (author_field, after)
+
         es_query = """
         {
           "size": 0,
           %s
           "aggs": {
             "author": {
-              "terms": {
-                "field": "%s",
-                "size": 30000
+              "composite": {
+                "sources": [
+                  {
+                    "%s": {
+                      "terms": {
+                        "field": "%s"
+                      }
+                    }
+                  }
+                ],
+                %s
+                "size": 10000
               },
               "aggs": {
                 "min": {
@@ -1964,7 +2057,7 @@ class Enrich(ElasticItems):
             }
           }
         }
-        """ % (query_type, author_field, date_field, date_field)
+        """ % (query_type, author_field, author_field, query_after, date_field, date_field)
 
         return es_query
 
@@ -2075,7 +2168,8 @@ class Enrich(ElasticItems):
         logger.info("[enrich-feelings] Start study on {} with data from {}".format(
             anonymize_url(self.elastic.index_url), nlp_rest_url))
 
-        es = ES([self.elastic_url], timeout=3600, max_retries=50, retry_on_timeout=True, verify_certs=False)
+        es = ES([self.elastic_url], timeout=3600, max_retries=50, retry_on_timeout=True,
+                verify_certs=self.elastic.requests.verify, connection_class=RequestsHttpConnection)
         search_fields = [attr for attr in attributes]
         search_fields.extend([uuid_field])
         page = es.search(index=enrich_backend.elastic.index,

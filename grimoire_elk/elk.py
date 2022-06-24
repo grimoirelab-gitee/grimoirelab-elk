@@ -35,11 +35,34 @@ from .enriched.utils import get_last_enrich, grimoire_con, get_diff_current_date
 from .utils import get_connectors, get_connector_from_name, get_elastic
 
 IDENTITIES_INDEX = "grimoirelab_identities_cache"
+SECRET_PARAMETERS = ["--api-token", "--backend-password"]
 SIZE_SCROLL_IDENTITIES_INDEX = 1000
 
 logger = logging.getLogger(__name__)
 
 requests_ses = grimoire_con()
+
+
+def anonymize_params(parameters):
+    """ The following parameters after SECRET_PARAMETERS will be
+    replaced by 'xxxxx' until the parameter starts with '-'.
+
+    :param parameters: list of parameters
+    :return: list of anonymized parameter
+    """
+
+    secret_param = False
+    param_list = list(parameters)
+    for i, param in enumerate(param_list):
+        if secret_param and param.startswith('-'):
+            secret_param = False
+
+        if not secret_param and param in SECRET_PARAMETERS:
+            secret_param = True
+        elif secret_param:
+            param_list[i] = "xxxxx"
+
+    return tuple(param_list)
 
 
 def feed_backend(url, clean, fetch_archive, backend_name, backend_params,
@@ -180,8 +203,18 @@ def feed_backend(url, clean, fetch_archive, backend_name, backend_params,
         else:
             error_msg = "Error feeding raw from {}".format(ex)
             logger.error(error_msg, exc_info=True)
+    except SystemExit:
+        anonymized_params = anonymize_params(backend_params)
+        msg = "Wrong {} arguments: {}".format(backend_name, anonymized_params)
+        error_msg = "Error feeding raw. {}".format(msg)
+        logger.error(error_msg, exc_info=True)
 
-    logger.info("[{}] Done collection for {}".format(backend_name, anonymize_url(backend.origin)))
+    try:
+        msg = "[{}] Done collection for {}".format(backend_name, anonymize_url(backend.origin))
+    except AttributeError:
+        msg = "[{}] Done collection for {}".format(backend_name, anonymize_url(projects_json_repo))
+    logger.info(msg)
+
     return error_msg
 
 
@@ -354,7 +387,7 @@ def enrich_items(ocean_backend, enrich_backend, events=False):
     return total
 
 
-def get_ocean_backend(backend_cmd, enrich_backend, no_incremental, filter_raw=None):
+def get_ocean_backend(backend_cmd, enrich_backend, no_incremental, filter_raw=None, repo_spaces=None):
     """ Get the ocean backend configured to start from the last enriched date """
 
     if no_incremental:
@@ -398,6 +431,8 @@ def get_ocean_backend(backend_cmd, enrich_backend, no_incremental, filter_raw=No
 
     if filter_raw:
         ocean_backend.set_filter_raw(filter_raw)
+    if repo_spaces:
+        ocean_backend.set_repo_spaces(repo_spaces)
 
     return ocean_backend
 
@@ -451,7 +486,8 @@ def enrich_backend(url, clean, backend_name, backend_params, cfg_section_name,
                    jenkins_rename_file=None,
                    unaffiliated_group=None, pair_programming=False,
                    node_regex=False, studies_args=None, es_enrich_aliases=None,
-                   last_enrich_date=None, projects_json_repo=None, repo_labels=None):
+                   last_enrich_date=None, projects_json_repo=None, repo_labels=None,
+                   repo_spaces=None):
     """ Enrich Ocean index """
 
     backend = None
@@ -512,7 +548,9 @@ def enrich_backend(url, clean, backend_name, backend_params, cfg_section_name,
 
         enrich_backend.set_projects_json_repo(projects_json_repo)
         enrich_backend.set_repo_labels(repo_labels)
-        ocean_backend = get_ocean_backend(backend_cmd, enrich_backend, no_incremental, filter_raw)
+        enrich_backend.set_repo_spaces(repo_spaces)
+
+        ocean_backend = get_ocean_backend(backend_cmd, enrich_backend, no_incremental, filter_raw, repo_spaces)
 
         if only_studies:
             logger.info("Running only studies (no SH and no enrichment)")
@@ -575,8 +613,18 @@ def enrich_backend(url, clean, backend_name, backend_params, cfg_section_name,
                          backend_name, anonymize_url(backend.origin), ex), exc_info=True)
         else:
             logger.error("Error enriching raw {}".format(ex), exc_info=True)
+    except SystemExit:
+        anonymized_params = anonymize_params(backend_params)
+        msg = "Wrong {} arguments: {}".format(backend_name, anonymized_params)
+        error_msg = "Error enriching raw. {}".format(msg)
+        logger.error(error_msg, exc_info=True)
 
-    logger.info("[{}] Done enrichment for {}".format(backend_name, anonymize_url(backend.origin)))
+    try:
+        msg = "[{}] Done enrichment for {}".format(backend_name, anonymize_url(backend.origin))
+    except AttributeError:
+        msg = "[{}] Done enrichment for {}".format(backend_name, anonymize_url(projects_json_repo))
+
+    logger.info(msg)
 
 
 def delete_orphan_unique_identities(es, sortinghat_db, current_data_source, active_data_sources):
