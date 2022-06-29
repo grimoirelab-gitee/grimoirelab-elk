@@ -603,6 +603,7 @@ class GitHubEnrich(Enrich):
         labels = []
         [labels.append(label['name']) for label in issue['labels'] if 'labels' in issue]
         rich_issue['labels'] = labels
+        rich_issue['num_comments'] = issue['comments']
 
         rich_issue['pull_request'] = True
         rich_issue['item_type'] = 'pull request'
